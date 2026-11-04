@@ -1,0 +1,15 @@
+node_modules/
+artifacts/
+cache/
+coverage/
+coverage.json
+typechain-types/
+
+# Secrets : jamais dans le dépôt
+.env
+.env.*
+!.env.example
+
+# Fichiers d'adresses de développement local (régénérés à chaque `hardhat node`)
+deployments/localhost.json
+deployments/hardhat.json
