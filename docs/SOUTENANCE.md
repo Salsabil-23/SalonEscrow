@@ -2,7 +2,7 @@
 
 > Organisé selon la grille d'évaluation : **(1) concepts et conception · (2) smart contracts, sécurité et tests ·
 > (3) questions / réponses · (4) utilisation de l'IA générative.**
-> Chiffres vérifiés le 10/11/2026 : **182 tests réussis**, couverture des contrats de production **100 % des lignes et
+> Chiffres vérifiés le 10/11/2026 : **182 tests réussis** (contrats) et **1 138 tests réussis** côté Salonia, couverture des contrats de production **100 % des lignes et
 > des fonctions, 92,9 % des branches**, analyse statique **Slither : aucune vulnérabilité** (seul l'avertissement
 > informatif `timestamp`, justifié en §2.4).
 
@@ -105,6 +105,38 @@ performance. **Salonia (MongoDB) reste l'autorité sur le planning ; la chaîne 
 **Règles métier** : acompte fixé par le centre (jamais par le client) et **figé à la réservation** ; annulation
 ≥ 24 h avant → remboursé au client, sinon → salon ; prestation validée ou absence (début + 15 min) → salon ;
 chaque acompte réglé **une seule fois**.
+
+### 1.6 Cycle de vie d'une réservation (machine à états)
+```
+                       createBooking (client, créneau libre, aligné 30 min, dans le futur)
+            None ─────────────────────────────────────────────────────────► Confirmed
+                                                                              │
+     ┌────────────────────────────┬───────────────────────────────┬──────────┴──────────────────┐
+     │ cancelBooking (client,     │ cancelBooking (client,        │ markCompleted (staff du     │ markNoShow (staff du
+     │ ≥ 24 h avant le début)     │ < 24 h, avant le début)       │ centre, dès le début)       │ centre, début + 15 min)
+     ▼                            ▼                               ▼                             ▼
+ Cancelled                    Cancelled                       Completed                      NoShow
+ acompte → client             acompte → salon                 acompte → salon                acompte → salon
+ créneau libéré               créneau libéré
+```
+Les quatre statuts d'arrivée sont **définitifs** : aucune fonction ne les quitte (testé : rejeu, double règlement).
+« Acompte → X » signifie : le solde de X est **crédité** ; X le retire ensuite avec `withdraw` (pull payment).
+
+### 1.7 Déroulé d'une réservation (séquence)
+```
+Client (MetaMask)        Salonia (serveur)                 BookingEscrow                  MockTND
+     │ choisit un créneau ──►│ crée le RDV PENDING (15 min)     │                              │
+     │                       │ et renvoie centerId, praticien   │                              │
+     │ approve(escrow, 30) ──────────────────────────────────────────────────────────────────►│
+     │ createBooking(c, p, t) ─────────────────────────────────►│ vérifie créneau, statut      │
+     │                       │                                  │ écrit la réservation         │
+     │                       │                                  │ transferFrom(client→escrow) ►│
+     │                       │                                  │ émet BookingCreated          │
+     │ hash de la tx ───────►│ lit le reçu, décode l'événement, │                              │
+     │                       │ compare client/centre/praticien/ │                              │
+     │                       │ heure → RDV CONFIRMED            │                              │
+```
+Le navigateur n'envoie qu'un **hash de transaction** : le serveur ne le croit pas sur parole, il relit la chaîne.
 
 ---
 
@@ -304,6 +336,13 @@ l'activité du compte dans MetaMask ; l'application affiche ce conseil automatiq
 | Après redémarrage de Hardhat, réservation bloquée « déjà réservée sur la blockchain » | Les numéros de réservation repartent de 1 et entrent en conflit avec l'index unique | Reproduction pas à pas | Détachement automatique des acomptes de l'ancienne chaîne au redéploiement |
 | Rendez-vous libéré à l'expiration alors que le paiement avait eu lieu | Page fermée pendant MetaMask | Scénario de test manuel | Reprise par les événements de la chaîne (`recoverEscrowHold`) + test |
 | Erreur MetaMask « Nonce too high » | Ce n'est pas un bug du contrat | Lecture de l'erreur | Message clair dans l'application + procédure de démo |
+| Version de Hardhat proposée (2.22) | Conflit de dépendances | `npm install` échouait | Version alignée sur celle du Membre 2 (2.29.1) |
+| Contrat de test (harness) sans l'import de `CenterAccess` | Ne compilait pas | Erreur du compilateur | Import ajouté, même ordre d'héritage que les contrats réels |
+| Attribution du numéro de centre (`chainId`) | Un centre pouvait rester à `null` | Test unitaire de `ids.ts` | Compteur atomique (`findOneAndUpdate`) |
+| Détection de MetaMask avec `typeof window` dans le rendu | Erreur d'hydratation React | Console du navigateur | `useSyncExternalStore` |
+| Connexion MetaMask : erreur 4100 (« Unauthorized ») | Le site n'avait pas la permission du compte | Test manuel avec un 2ᵉ compte | `wallet_requestPermissions` puis nouvel essai |
+| Carte du wallet qui gardait le solde d'un autre client | État React réutilisé entre deux sessions | Test manuel (changement de compte) | Clé React liée à l'utilisateur et aux soldes |
+| Idée d'« importer la clé privée » du client dans l'application | **Dangereux** : la clé quitterait MetaMask | Relecture (règle de sécurité) | Refusé : le client signe tout dans MetaMask, aucune clé client côté serveur |
 
 ### 4.3 Ce que nous maîtrisons sans l'IA
 Nous savons expliquer chaque fonction, chaque modificateur et chaque test de ce dossier (voir §3). Les choix
