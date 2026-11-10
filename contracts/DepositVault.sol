@@ -119,8 +119,8 @@ abstract contract DepositVault is EscrowHooks, CenterAccess, ReentrancyGuard {
         _balances[msg.sender] = 0;
         totalCredited -= amount;
 
-        token.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
     }
 
     // ═══════════════════════════════ Lectures ═══════════════════════════════
@@ -173,9 +173,11 @@ abstract contract DepositVault is EscrowHooks, CenterAccess, ReentrancyGuard {
         d.status = DepositStatus.Locked;
         d.amount = amount;
         totalLocked += amount;
+        // Événement émis AVANT l'interaction (ordre strict vérifier → modifier → interagir, signalé par Slither) :
+        // si le transfert échoue, toute la transaction est annulée, événement compris.
+        emit DepositLocked(bookingId, centerId, client, amount);
 
         token.safeTransferFrom(client, address(this), amount);
-        emit DepositLocked(bookingId, centerId, client, amount);
     }
 
     /// @inheritdoc EscrowHooks

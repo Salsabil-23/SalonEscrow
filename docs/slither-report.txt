@@ -1,0 +1,22 @@
+'npx hardhat clean' running (wd: C:\Users\USER\Desktop\nextjs\SalonEscrow)
+'npx hardhat clean --global' running (wd: C:\Users\USER\Desktop\nextjs\SalonEscrow)
+'npx hardhat compile --force' running (wd: C:\Users\USER\Desktop\nextjs\SalonEscrow)
+INFO:Detectors:
+Detector: timestamp
+DepositVault._settleCancelled(uint256,uint64) (contracts/DepositVault.sol#186-191) uses timestamp for comparisons
+	Dangerous comparisons:
+	- refunded = block.timestamp + REFUND_WINDOW <= startTime (contracts/DepositVault.sol#188)
+SlotBooking.createBooking(uint32,uint32,uint64) (contracts/SlotBooking.sol#75-104) uses timestamp for comparisons
+	Dangerous comparisons:
+	- startTime <= block.timestamp || startTime % SLOT_DURATION != 0 (contracts/SlotBooking.sol#80)
+SlotBooking.cancelBooking(uint256) (contracts/SlotBooking.sol#108-119) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp >= booking.startTime (contracts/SlotBooking.sol#112)
+SlotBooking.markCompleted(uint256) (contracts/SlotBooking.sol#122-131) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp < booking.startTime (contracts/SlotBooking.sol#126)
+SlotBooking.markNoShow(uint256) (contracts/SlotBooking.sol#134-144) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp < allowedFrom (contracts/SlotBooking.sol#139)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#block-timestamp
+INFO:Slither:. analyzed (28 contracts with 102 detectors), 5 result(s) found
