@@ -349,3 +349,165 @@ Nous savons expliquer chaque fonction, chaque modificateur et chaque test de ce 
 structurants (pull payment, montant fixé par le centre, aucune donnée personnelle sur la chaîne, MetaMask pour le
 client) ont été **décidés et justifiés par l'équipe** (`docs/DECISIONS.md`), l'IA ayant servi à les implémenter et à
 les tester.
+
+---
+
+## 5. Guide du code : chaque fichier, chaque fonction
+
+> Lecture : **Qui** = qui a le droit d'appeler · **Vérifie** = conditions contrôlées (sinon erreur) ·
+> **Effet** = ce qui change · **Événement** = ce qui est émis sur la chaîne.
+
+### 5.1 Contrats (`SalonEscrow/contracts/`)
+
+#### `CenterAccess.sol` : les droits (abstrait, hérite d'`Ownable` d'OpenZeppelin)
+Stockage : `_managers[centerId] → gérant`, `_staff[centerId][compte] → bool`.
+
+| Fonction | Qui | Vérifie | Effet / événement |
+|---|---|---|---|
+| `constructor(admin)` | déploiement | `Ownable` refuse l'adresse nulle | `admin` devient propriétaire |
+| `setCenterManager(centerId, manager)` | administrateur (`onlyOwner`) | adresse non nulle (`ZeroAddress`) | nomme ou remplace le gérant · `CenterManagerSet` |
+| `setStaff(centerId, compte, allowed)` | admin ou gérant **de ce centre** (`onlyCenterAdmin`) | adresse non nulle | ajoute / retire un staff · `StaffSet` |
+| `managerOf(centerId)` / `isStaff(centerId, compte)` | tous (lecture) | — | — |
+| modificateur `onlyCenterAdmin` | — | appelant = owner ou gérant du centre, sinon `NotCenterManager` | — |
+| modificateur `onlyCenterStaff` | — | appelant staff du centre, sinon `NotCenterStaff` | — |
+
+À dire : **le gérant n'est pas staff d'office** ; il ne valide une prestation que s'il s'est nommé staff.
+
+#### `EscrowHooks.sol` : le « contrat » entre réservation et argent (abstrait)
+Quatre fonctions `internal virtual` **sans corps** : `SlotBooking` les appelle, `DepositVault` les écrit.
+`internal` = aucun compte extérieur ne peut les appeler. Pourquoi un contrat abstrait et pas une `interface` ?
+Une interface Solidity ne peut contenir que des fonctions `external`.
+
+| Crochet | Rôle |
+|---|---|
+| `_depositFor(centerId) → montant` | acompte exigé par le centre (revert `CenterNotConfigured`) |
+| `_lockDeposit(bookingId, centerId, client) → montant` | prend l'acompte au client et le bloque |
+| `_settleCancelled(bookingId, startTime) → refunded` | applique la règle des 24 h |
+| `_settleToSalon(bookingId)` | crédite le salon (prestation ou absence) |
+
+#### `SlotBooking.sol` : créneaux et cycle de vie (**mon fichier**, abstrait)
+Constantes : `SLOT_DURATION = 30 minutes`, `NO_SHOW_DELAY = 15 minutes`.
+Types : `enum BookingStatus { None, Confirmed, Cancelled, Completed, NoShow }` ;
+`struct Booking { client, centerId (uint32), practitionerId (uint32), startTime (uint64), deposit, status }`.
+Stockage : `bookingCount` (identifiants à partir de 1), `_bookings[id]`, `_slotOwner[clé du créneau] → id` (0 = libre).
+
+| Fonction | Qui | Vérifie (erreur) | Effet / événement |
+|---|---|---|---|
+| `createBooking(centerId, practitionerId, startTime)` | tout client (`msg.sender`), `nonReentrant` | heure future et multiple de 30 min (`InvalidStartTime`) ; créneau libre (`SlotAlreadyBooked`) ; centre configuré (`CenterNotConfigured`) | réservation `Confirmed`, créneau occupé, `BookingCreated`, **puis** `_lockDeposit` (transfert en dernier). Renvoie l'id |
+| `cancelBooking(bookingId)` | **le client de la réservation** | existe (`BookingNotFound`) ; bon client (`NotBookingClient`) ; statut `Confirmed` (`InvalidStatus`) ; avant le début (`BookingAlreadyStarted`) | statut `Cancelled`, **créneau libéré**, `_settleCancelled` · `BookingCancelled(refunded)` |
+| `markCompleted(bookingId)` | staff **du centre de la réservation** | existe ; staff (`NotCenterStaff`) ; `Confirmed` ; début atteint (`TooEarly`) | statut `Completed`, `_settleToSalon` · `BookingCompleted` |
+| `markNoShow(bookingId)` | staff du centre | idem, mais début + 15 min (`TooEarly`) | statut `NoShow`, `_settleToSalon` · `BookingNoShow` |
+| `getBooking(id)` | lecture | — | fiche complète (statut `None` si inconnue) |
+| `isSlotFree(c, p, t)` / `bookingAtSlot(c, p, t)` | lecture | — | créneau libre ? / quelle réservation l'occupe |
+| `slotKey(c, p, t)` | `pure` | — | `keccak256(abi.encode(c, p, t))` : clé unique sans collision |
+| `_existingBooking`, `_requireConfirmed`, `_requireCenterStaff` | `private` | regroupent les contrôles ci-dessus | `_requireConfirmed` garantit le **règlement unique** |
+
+Pourquoi lire l'acompte (`_depositFor`) **avant** d'écrire la réservation : pour le stocker dans `Booking.deposit`
+et l'émettre dans `BookingCreated` ; `_lockDeposit` relit la même configuration dans la même transaction.
+
+#### `DepositVault.sol` : l'argent (Membre 2, abstrait)
+Constante `REFUND_WINDOW = 24 hours` ; `token` **immutable** (MockTND).
+Stockage : `_deposits[centre]`, `_treasuries[centre]`, `_balances[bénéficiaire]`, `_lockedDeposits[bookingId]`
+(`client`, `centerId`, `status None/Locked/Settled`, `amount`), compteurs `totalLocked` et `totalCredited`.
+
+| Fonction | Qui | Vérifie (erreur) | Effet / événement |
+|---|---|---|---|
+| `constructor(token)` | déploiement | jeton non nul | jeton fixé pour toujours |
+| `setDeposit(centerId, montant)` | admin ou gérant du centre | montant > 0 (`InvalidDepositAmount`) | nouvel acompte, pour les **nouvelles** réservations seulement · `DepositSet` |
+| `setTreasury(centerId, adresse)` | admin ou gérant du centre | adresse non nulle | portefeuille du salon · `TreasurySet` |
+| `withdraw()` | **chacun pour soi** (`nonReentrant`) | solde > 0 (`NothingToWithdraw`) | solde remis à 0, `totalCredited` baissé, `Withdrawn`, **puis** `safeTransfer` |
+| `balanceOf`, `depositOf`, `treasuryOf`, `lockedDepositOf` | lecture | — | — |
+| `_depositFor` (crochet) | interne | acompte > 0 **et** trésorerie définie (`CenterNotConfigured`) | — |
+| `_lockDeposit` (crochet) | interne | client non nul ; pas déjà bloqué (`DepositAlreadyLocked`) | copie le montant, `Locked`, `totalLocked +=`, `DepositLocked`, **puis** `safeTransferFrom(client → contrat)` |
+| `_settleCancelled` (crochet) | interne | acompte `Locked` (`DepositNotLocked`) | `refunded = maintenant + 24 h <= début` → crédite le client, sinon la trésorerie |
+| `_settleToSalon` (crochet) | interne | acompte `Locked` | crédite la trésorerie |
+| `_takeLocked` | `private` | statut `Locked` | passe à `Settled` **avant** tout crédit (anti double règlement) |
+| `_credit` | `private` | — | `_balances[b] +=`, `totalCredited +=` · `DepositCredited` (aucun jeton ne bouge) |
+
+Invariant (vérifié à chaque étape du fuzzing) : `token.balanceOf(contrat) == totalLocked + totalCredited`.
+La règle des 24 h est écrite en **addition** (`now + 24 h <= start`) pour ne jamais soustraire sous zéro.
+
+#### `BookingEscrow.sol` : le contrat déployé
+`contract BookingEscrow is SlotBooking, DepositVault` ; constructeur `(admin, token)` qui appelle `CenterAccess(admin)`
+et `DepositVault(token)`. Aucune fonction propre : il **relie** les crochets des deux parents.
+
+#### `MockTND.sol` : le jeton de test
+ERC-20 d'OpenZeppelin non modifié, `decimals() = 6` (1 TND = 1 000 000 unités).
+`faucet(montant)` : tout le monde, entre 1 unité et `MAX_FAUCET_AMOUNT` = 1 000 TND (`FaucetZeroAmount`,
+`FaucetAmountTooHigh`) → `_mint` vers l'appelant. Fonctions standard utilisées : `approve`, `allowance`,
+`transferFrom`, `transfer`, `balanceOf`.
+
+#### `contracts/test/SlotBookingHarness.sol`
+Version de test de `SlotBooking` avec un **faux coffre** : teste mon contrat seul, sans le jeton.
+
+### 5.2 Tests (`SalonEscrow/test/`)
+| Fichier | Ce qu'il prouve |
+|---|---|
+| `SlotBooking.test.js` | créneaux, double réservation (`SlotAlreadyBooked`), statuts définitifs, droits, bornes horaires |
+| `DepositVault.test.js` | règle des 24 h, crédits, retraits, jetons hostiles (réentrance, retour `false`) |
+| `MockTND.test.js` | décimales, faucet et plafond |
+| `BookingEscrow.test.js`, `FinancialScenarios.test.js`, `Accounting.test.js` | parcours complets avec le vrai jeton, invariant comptable |
+| `AssemblyCheck.test.js` | héritage et crochets bien reliés |
+| `Security.test.js` | les 8 familles d'attaques du §2.3 |
+
+`scripts/gas.js` : mesure du gaz (§3, Q14).
+
+### 5.3 Salonia : côté serveur (`projetnext/lib/escrow/`)
+| Fichier | Fonctions | Rôle |
+|---|---|---|
+| `config.ts` | `parseEscrowEnv`, `escrowConfig`, `isEscrowEnabled`, `requireEscrowConfig` | lit les variables `ESCROW_*` (réseau, RPC, adresses) ; vides → fonctionnalité désactivée |
+| | `adminAccount` | compte administrateur (clé d'environnement, testnet) |
+| | `userAccount(index)`, `treasuryAccount(centre)` | comptes **dérivés** de la phrase HD (staff, trésoreries) : seul l'index est en base |
+| `rules.ts` (pur, testé) | `isEscrowSlot` | heure alignée sur 30 min, comme le contrat |
+| | `cancellationOutcome` | `REFUND` / `SALON` / `STARTED` : même règle des 24 h que le contrat, affichée **avant** de signer |
+| | `staffActions` | le staff peut-il valider (début) ou marquer l'absence (début + 15 min) ? |
+| | `escrowStatusFromChain`, `bookingStatusForEscrow` | 0–4 de la chaîne → statuts Salonia |
+| | `unitsToTnd`, `toChainTime`, `isUint32` | 30000000 → « 30 » ; date → secondes Unix ; contrôle des numéros |
+| `ids.ts` | `ensureCenterChainId`, `ensurePractitionerChainId`, `ensureWalletIndex` | donne une fois pour toutes un **numéro** (uint32) à un centre, un praticien, un wallet ; compteur atomique (`$inc`) |
+| `abi.ts` | `bookingEscrowAbi`, `mockTndAbi` | description des fonctions et événements, pour viem |
+| `chain.ts` (seul fichier qui parle à la chaîne) | `getBooking`, `isSlotFree`, `depositOf`, `treasuryOf`, `tokenBalanceOf`, `escrowBalanceOf`, `ethBalanceOf` | lectures du contrat |
+| | `bookingCreatedInTx`, `bookingCancelledInTx` | relit le **reçu** : succès, bon contrat, puis décode l'événement émis par le contrat |
+| | `bookingsCreatedBy`, `transactionExists` | réservations d'un wallet (reprise) ; la transaction existe-t-elle encore ? |
+| | `fundGas` | un peu d'ETH de test pour le gaz du client |
+| | `settleBookingOnChain` | staff : `setStaff` si besoin (admin), puis `markCompleted` / `markNoShow` |
+| | `configureCenterOnChain` | admin : `setTreasury` + `setDeposit` d'un centre (script de démo) |
+| | `createBookingOnChain`, `cancelBookingOnChain` | wallet serveur : **seulement pour le test** `scripts/escrow-smoke.ts` |
+| `service.ts` (droits + base) | `prepareEscrowIntent` | vérifie le RDV (au client, `PENDING`, créneau aligné, salon configuré, wallet relié) ; attente de 15 min ; renvoie centre, praticien, heure, acompte à MetaMask |
+| | `confirmEscrowFromTx` | **cœur de la sécurité** : relit `BookingCreated`, compare client, centre, praticien, heure ; confirme le RDV ; index unique : une transaction ne sert qu'une fois |
+| | `abandonEscrowIntent`, `rollbackUnpaidBooking` | refus dans MetaMask → créneau rendu |
+| | `recoverEscrowHold`, `releaseExpiredHolds` | page fermée pendant MetaMask : retrouve le paiement sur la chaîne avant de libérer ; chaîne injoignable → on ne libère pas |
+| | `confirmCancelFromTx` | relit `BookingCancelled` (bon RDV, bon client) puis met la base à jour |
+| | `settleEscrowBookingByStaff` | vérifie statut et délais, appelle `settleBookingOnChain`, met la base à jour |
+| | `readEscrowStatuses` | statut lu sur la chaîne pour l'affichage (la chaîne fait foi) |
+| | `getEscrowOffers`, `isSlotFreeOnChain`, `findMyEscrowHold`, `detachStaleLocalEscrows` | offres par centre ; créneau libre ; reprise d'une attente ; nettoyage après redémarrage de Hardhat |
+| `errors.ts` | `EscrowError`, `messageForContractError`, `toEscrowError` | traduit `SlotAlreadyBooked`, `TooEarly`… en messages clairs (FR/AR) |
+| `explorer-core.ts`, `explorer.ts` | `readChainActivity`, `getBlockchainExplorer` | lit les derniers blocs, transactions et événements ; nomme les adresses (client, trésorerie…) |
+
+### 5.4 Salonia : MetaMask et connexion (`lib/wallet/`, `lib/models/chain.ts`)
+| Fichier | Fonctions | Rôle |
+|---|---|---|
+| `lib/models/chain.ts` | `chainModels`, `chainDbName` | **base séparée** `<base>_chain` : `WalletAccount` (adresse ↔ userId, uniques) et `WalletNonce` (usage unique, supprimé seul à expiration) |
+| `siwe.ts` | `issueNonce` | nonce valable 10 min (connexion ou liaison) |
+| | `verifySiwe` | message EIP-4361 : format, **domaine**, réseau, fraîcheur, **signature**, puis consommation atomique du nonce (anti-rejeu) ; renvoie l'adresse |
+| `service.ts` | `linkWallet` | relie un wallet au compte connecté (un wallet = un compte) |
+| | `unlinkWallet`, `assertNoActiveEscrow` | refuse de délier un wallet qui a un acompte bloqué (lui seul peut annuler) |
+| | `walletLogin`, `getLinkedWallet` | connexion : la signature prouve le wallet, la base dit à quel compte il appartient |
+| `browser.ts` (navigateur) | `connectMetaMask` | demande le compte, bascule ou ajoute le réseau (Hardhat 31337 / Sepolia) |
+| | `signInMessage` | construit et fait signer le message SIWE |
+| | `bookWithMetaMask` | faucet si besoin → `approve` du **montant exact** → `createBooking` ; chaque appel est d'abord **simulé** (pas de gaz perdu) |
+| | `cancelWithMetaMask`, `faucetWithMetaMask`, `withdrawWithMetaMask` | `cancelBooking`, `faucet`, `withdraw` signés par le client |
+| | `watchMockTnd`, `watchActiveAccount`, `metaMaskMessage` | ajoute le jeton dans MetaMask ; suit le changement de compte ; messages d'erreur clairs |
+
+### 5.5 Salonia : actions serveur, écrans, scripts
+| Fichier | Fonctions / composant | Rôle |
+|---|---|---|
+| `auth.ts` | fournisseur `wallet` (NextAuth) | session ouverte par `walletLogin` |
+| `app/actions/wallet.ts` | `getLoginNonce`, `getLinkNonce`, `loginWithWallet`, `linkMyWallet`, `unlinkMyWallet`, `getMyWalletInfo`, `requestTestGas`, `getEscrowWebConfig` | revérifient la session, appellent le service, journalisent (`WALLET_LINKED`…) |
+| `app/actions/public-booking.ts` | `getEscrowSlotStatus`, `confirmEscrowBooking`, `abandonEscrowBooking` | réservation publique avec acompte |
+| `app/actions/client.ts` | `confirmMyEscrowCancel` | annulation par le client |
+| `app/actions/bookings.ts` | `settleEscrowBooking`, `getEscrowChainStatus` | staff : prestation / absence (droits du centre revérifiés) |
+| `components/wallet/metamask.tsx` | carte wallet, bouton de connexion | relier, soldes, faucet, retrait |
+| `components/booking/escrow-deposit.tsx`, `escrow-booking-status.tsx` | écran de réservation | étapes approve → createBooking, statut |
+| `components/calendar/escrow-panel.tsx` | calendrier du staff | « Prestation réalisée » / « Client absent » |
+| `components/escrow/blockchain-explorer.tsx`, `app/dashboard/blockchain/page.tsx` | explorateur | toutes les transactions lues sur la chaîne |
+| `scripts/escrow-dev.ts`, `dev-blockchain.mjs`, `escrow-explorer.ts`, `escrow-smoke.ts` | scripts | déployer en local, lancer Salonia en mode blockchain, lister les transactions, test de bout en bout |
